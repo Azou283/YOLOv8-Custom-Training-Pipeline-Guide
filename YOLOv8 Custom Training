@@ -1,0 +1,421 @@
+# ==============================================================================
+# CELLS 1--3: ENVIRONMENT SETUP & IMPORTS
+# ==============================================================================
+import os
+import sys
+import shutil
+import zipfile
+import datetime
+import importlib
+import subprocess
+from pathlib import Path
+
+# Check GPU availability
+result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+print(result.stdout)
+if not result.stdout.strip():
+    raise EnvironmentError(
+        "No GPU detected. Enable GPU in Kaggle Settings -> Accelerator."
+    )
+
+# Install Ultralytics (uncomment if required)
+# !pip install ultralytics --quiet
+
+import ultralytics
+ultralytics.checks()
+
+import yaml
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import FancyBboxPatch
+
+from ultralytics import YOLO
+
+print("All imports OK") 
+
+# ==============================================================================
+# CELL 4: DATASET MOUNTING AND PATH CONFIGURATION
+# ==============================================================================
+DATASET_PATH = '/kaggle/input/datasets/azzeddinelarid/waste-sorting'
+
+if not os.path.isdir(DATASET_PATH):
+    raise FileNotFoundError(
+        f"Dataset folder not found: {DATASET_PATH}\n"
+        "Check the dataset slug in Data -> Add Data."
+    )
+
+print("Dataset root contents:")
+for item in sorted(os.listdir(DATASET_PATH)):
+    print(f"  {item}")
+
+# ==============================================================================
+# CELL 5: DATASET STRUCTURE VERIFICATION
+# ==============================================================================
+yaml_path = os.path.join(DATASET_PATH, 'data.yaml')
+
+if not os.path.exists(yaml_path):
+    raise FileNotFoundError(
+        f"data.yaml not found at {yaml_path}\n"
+        "Make sure the dataset follows standard YOLOv8 layout."
+    )
+
+print(f"data.yaml found at: {yaml_path}\n")
+print("-" * 40)
+with open(yaml_path) as f:
+    print(f.read())
+print("-" * 40)
+
+# ==============================================================================
+# CELL 6: FIXING ABSOLUTE PATHS IN data.yaml
+# ==============================================================================
+with open(yaml_path) as f:
+    data_cfg = yaml.safe_load(f)
+
+print("Original data.yaml:")
+print(data_cfg)
+
+data_cfg['path']  = DATASET_PATH
+data_cfg['train'] = os.path.join(DATASET_PATH, 'train', 'images')
+data_cfg['val']   = os.path.join(DATASET_PATH, 'valid', 'images')
+
+HAS_TEST_SPLIT = os.path.isdir(os.path.join(DATASET_PATH, 'test', 'images'))
+if HAS_TEST_SPLIT:
+    data_cfg['test'] = os.path.join(DATASET_PATH, 'test', 'images')
+else:
+    data_cfg.pop('test', None)
+    print("No test split found -- 'test' key removed from yaml.")
+
+PATCHED_YAML = '/kaggle/working/data.yaml'
+with open(PATCHED_YAML, 'w') as f:
+    yaml.dump(data_cfg, f, default_flow_style=False)
+
+print("Patched data.yaml written to:", PATCHED_YAML)
+print("-" * 40)
+with open(PATCHED_YAML) as f:
+    print(f.read())
+print("-" * 40)
+
+# ==============================================================================
+# CELL 7: LOADING THE PRETRAINED MODEL
+# ==============================================================================
+model = YOLO('yolov8s.pt')
+model.info()
+
+# ==============================================================================
+# CELL 8: TRAINING
+# ==============================================================================
+shutil.rmtree('/kaggle/working/runs', ignore_errors=True)
+
+model = YOLO('yolov8s.pt')
+
+results = model.train(
+    data            = PATCHED_YAML,
+    epochs          = 50,
+    imgsz           = 640,
+    batch           = -1,
+    patience        = 10,
+    device          = 0,
+    workers         = 2,
+    project         = '/kaggle/working/runs',
+    name            = 'yolov8s_custom',
+    exist_ok        = True,
+    pretrained      = True,
+    optimizer       = 'auto',
+    lr0             = 0.01,
+    lrf             = 0.01,
+    momentum        = 0.937,
+    weight_decay    = 0.0005,
+    warmup_epochs   = 3.0,
+    warmup_momentum = 0.8,
+    box             = 7.5,
+    cls             = 0.5,
+    dfl             = 1.5,
+    augment         = True,
+    cache           = False,
+    seed            = 42,
+    verbose         = True,
+)
+
+RUN_DIR = Path(str(results.save_dir))
+
+print("\n=== Training complete ===")
+print(f"Best weights  : {RUN_DIR / 'weights' / 'best.pt'}")
+print(f"Last weights  : {RUN_DIR / 'weights' / 'last.pt'}")
+print(f"Results CSV   : {RUN_DIR / 'results.csv'}")
+
+# ==============================================================================
+# CELLS 9--10: CONFIRMING RESULTS AND VALIDATION
+# ==============================================================================
+try:
+    best_pt = RUN_DIR / 'weights' / 'best.pt'
+    last_pt = RUN_DIR / 'weights' / 'last.pt'
+
+    print("=== Training Results ===")
+    print(f"Run directory : {RUN_DIR}")
+    print(f"Best weights  : {best_pt}  "
+          f"({'exists' if best_pt.exists() else 'MISSING'})")
+    print(f"Last weights  : {last_pt}  "
+          f"({'exists' if last_pt.exists() else 'MISSING'})")
+
+except NameError:
+    print("ERROR: training results not found.")
+    print("Please run training block before this execution.")
+
+BEST_WEIGHTS = str(RUN_DIR / 'weights' / 'best.pt')
+val_model    = YOLO(BEST_WEIGHTS)
+
+VAL_SPLIT = 'test' if HAS_TEST_SPLIT else 'val'
+print(f"Running validation on split: '{VAL_SPLIT}'")
+
+metrics = val_model.val(
+    data   = PATCHED_YAML,
+    imgsz  = 640,
+    device = 0,
+    split  = VAL_SPLIT,
+)
+
+print("\n=== Validation Metrics ===")
+print(f"mAP@50      : {metrics.box.map50:.4f}")
+print(f"mAP@50-95   : {metrics.box.map:.4f}")
+print(f"Precision   : {metrics.box.mp:.4f}")
+print(f"Recall      : {metrics.box.mr:.4f}")
+
+# ==============================================================================
+# CELL 11: INFERENCE ON TEST IMAGES
+# ==============================================================================
+sample_image_path = os.path.join(DATASET_PATH, 'test', 'images')
+
+if os.path.isdir(sample_image_path):
+    inf_results = val_model.predict(
+        source    = sample_image_path,
+        imgsz     = 640,
+        conf      = 0.25,
+        iou       = 0.45,
+        save      = True,
+        save_conf = True,
+        project   = '/kaggle/working/runs',
+        name      = 'predict',
+        exist_ok  = True,
+    )
+    print("Prediction results saved to /kaggle/working/runs/predict/")
+else:
+    print(
+        f"Test image folder not found: {sample_image_path}\n"
+        "Inference skipped. Change the path to run on val images instead."
+    )
+
+# ==============================================================================
+# CELL 12: PACKAGING WEIGHTS FOR DOWNLOAD
+# ==============================================================================
+timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+zip_name  = f'/kaggle/working/yolov8s_custom_{timestamp}.zip'
+
+try:
+    weights_dir = Path(str(RUN_DIR)) / 'weights'
+
+    if not weights_dir.exists():
+        raise FileNotFoundError(
+            f"Weights folder not found: {weights_dir}"
+        )
+
+    with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for wf in weights_dir.glob('*.pt'):
+            zf.write(wf, wf.name)
+            print(f"  Added: {wf.name}")
+
+        results_csv = RUN_DIR / 'results.csv'
+        if results_csv.exists():
+            zf.write(results_csv, 'results.csv')
+            print("  Added: results.csv")
+        else:
+            print("  results.csv not found -- skipped.")
+
+    print(f"\nWeights zipped -> {zip_name}")
+    print("Download via Kaggle 'Output' tab -> Output Files.")
+
+except Exception as e:
+    print(f"Packaging failed: {e}")
+
+# ==============================================================================
+# CELL 13: MODEL EXPORT (NCNN WITH ONNX FALLBACK)
+# ==============================================================================
+print("=" * 55)
+print("  NCNN Export -- Dependency Check & Install")
+print("=" * 55)
+
+print("\n[1/4] Installing native system libraries...")
+native_pkgs = [
+    "libvulkan-dev", "libprotobuf-dev",
+    "protobuf-compiler", "cmake", "build-essential",
+]
+apt_result = subprocess.run(
+    ["apt-get", "install", "-y", "--quiet"] + native_pkgs,
+    capture_output=True, text=True
+)
+if apt_result.returncode != 0:
+    print("  apt-get warnings:")
+    print(apt_result.stderr[-500:])
+else:
+    print("  Native libraries installed.")
+
+print("\n[2/4] Installing Python dependencies...")
+for pkg in ["onnx", "onnxruntime", "onnxsim", "ncnn"]:
+    res = subprocess.run(
+        [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+        capture_output=True, text=True
+    )
+    status = "OK" if res.returncode == 0 else "FAILED"
+    print(f"  {status}: {pkg}")
+
+print("\n[3/4] Verifying imports...")
+required_modules = {
+    "onnx": "onnx", "onnxruntime": "onnxruntime",
+    "onnxsim": "onnxsim", "ncnn": "ncnn",
+}
+all_ok = True
+for display_name, module_name in required_modules.items():
+    try:
+        mod     = importlib.import_module(module_name)
+        version = getattr(mod, "__version__", "unknown")
+        print(f"  OK: {display_name} -- {version}")
+    except ImportError as e:
+        print(f"  FAILED: {display_name} -- {e}")
+        all_ok = False
+
+print("\n[4/4] Exporting...")
+if not all_ok:
+    print("  One or more dependencies failed. Falling back to ONNX.")
+    try:
+        export_path = val_model.export(format='onnx', imgsz=640)
+        print(f"  ONNX export saved -> {export_path}")
+    except Exception as e:
+        print(f"  ONNX export also failed: {e}")
+else:
+    try:
+        export_path = val_model.export(
+            format='ncnn', imgsz=640, int8=False, half=False,
+        )
+        export_dir = Path(str(export_path))
+        print(f"\n  NCNN export saved -> {export_dir}")
+        for fname in ["model.ncnn.param", "model.ncnn.bin"]:
+            fpath = export_dir / fname
+            size  = (f"({fpath.stat().st_size / 1e6:.1f} MB)"
+                     if fpath.exists() else "")
+            status = "OK" if fpath.exists() else "MISSING"
+            print(f"    {status}  {fname}  {size}")
+    except Exception as e:
+        print(f"\n  NCNN export failed: {e}")
+        print("  Falling back to ONNX...")
+        try:
+            export_path = val_model.export(format='onnx', imgsz=640)
+            print(f"  ONNX fallback saved -> {export_path}")
+        except Exception as e2:
+            print(f"  ONNX fallback also failed: {e2}")
+
+print("\nExport Step Complete!")
+
+# ==============================================================================
+# CELL 14: TRAINING DASHBOARD
+# ==============================================================================
+results_csv  = RUN_DIR / 'results.csv'
+best_weights = RUN_DIR / 'weights' / 'best.pt'
+
+if not results_csv.exists():
+    raise FileNotFoundError(
+        f"results.csv not found at {results_csv}\n"
+        "Make sure training has completed successfully."
+    )
+
+df = pd.read_csv(results_csv)
+df.columns = df.columns.str.strip()
+epochs = df['epoch'].values
+
+print("Detected columns:", list(df.columns))
+
+def find_col(df, *keywords):
+    kw_lower = [k.lower() for k in keywords]
+    for col in df.columns:
+        col_l = col.lower()
+        if all(k in col_l for k in kw_lower):
+            return col
+    return None
+
+map50_col   = find_col(df, 'map50')
+map5095_col = find_col(df, 'map50-95')
+prec_col    = find_col(df, 'precision')
+rec_col     = find_col(df, 'recall')
+box_col     = find_col(df, 'train', 'box')
+cls_col     = find_col(df, 'train', 'cls')
+dfl_col     = find_col(df, 'train', 'dfl')
+
+if map50_col and '95' in map50_col:
+    for col in df.columns:
+        if 'map50' in col.lower() and '95' not in col.lower():
+            map50_col = col
+            break
+
+best_idx   = df[map50_col].idxmax()
+best_map50 = df[map50_col].iloc[best_idx] * 100
+best_map   = df[map5095_col].iloc[best_idx] * 100
+best_prec  = df[prec_col].iloc[best_idx] * 100
+best_rec   = df[rec_col].iloc[best_idx] * 100
+best_f1    = 2 * best_prec * best_rec / (best_prec + best_rec + 1e-9)
+
+PURPLE = '#6B3FA0'; PURPLE_LT = '#C4A9E0'
+BG = '#FFFFFF'; CARD_BG = '#F7F4FB'
+GRAY = '#AAAAAA'; GREEN = '#27AE60'
+
+fig = plt.figure(figsize=(18, 14))
+fig.patch.set_facecolor(BG)
+gs  = gridspec.GridSpec(3, 3, figure=fig,
+                         hspace=0.55, wspace=0.35,
+                         top=0.93, bottom=0.06,
+                         left=0.06, right=0.97)
+
+fig.suptitle('YOLOv8s - Training Dashboard',
+             fontsize=15, fontweight='bold', color='#333333', y=0.98)
+
+dashboard_path = RUN_DIR / 'training_dashboard.png'
+plt.savefig(dashboard_path, dpi=150, bbox_inches='tight', facecolor=BG)
+plt.show()
+print(f"Dashboard saved -> {dashboard_path}")
+
+# ==============================================================================
+# CELL 14b: CONFUSION MATRIX
+# ==============================================================================
+val_model = YOLO(str(best_weights))
+
+val_metrics = val_model.val(
+    data      = PATCHED_YAML,
+    imgsz     = 640,
+    device    = 0,
+    split     = 'val',
+    plots     = True,
+    save_json = False,
+    project   = str(RUN_DIR.parent),
+    name      = 'val_confusion',
+    exist_ok  = True,
+)
+
+cm_dir  = RUN_DIR.parent / 'val_confusion'
+cm_path = cm_dir / 'confusion_matrix_normalized.png'
+
+if not cm_path.exists():
+    cm_path = cm_dir / 'confusion_matrix.png'
+
+if cm_path.exists():
+    img = plt.imread(str(cm_path))
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    ax2.imshow(img)
+    ax2.axis('off')
+    ax2.set_title('Confusion Matrix (Normalized)',
+                   fontsize=13, fontweight='bold',
+                   color='#333333', pad=10)
+    plt.tight_layout()
+    plt.show()
+    print(f"Confusion matrix loaded from: {cm_path}")
+else:
+    print("confusion_matrix.png not found -- check the run_dir path.")
+    print("Available PNG files:", list(cm_dir.glob('*.png')))
